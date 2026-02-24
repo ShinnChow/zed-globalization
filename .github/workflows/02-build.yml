@@ -243,18 +243,75 @@ jobs:
           rustup default stable
 
       - name: 安装 sccache
-        run: choco install sccache -y
+        shell: pwsh
+        run: |
+          $installed = $false
+
+          # 方案1: choco 安装（最多重试 3 次）
+          for ($i = 1; $i -le 3; $i++) {
+            Write-Host "Chocolatey 安装 sccache 尝试 $i/3..."
+            choco install sccache -y --no-progress 2>&1
+            if ($LASTEXITCODE -eq 0 -and (Get-Command sccache -ErrorAction SilentlyContinue)) {
+              Write-Host "choco 安装成功"
+              $installed = $true
+              break
+            }
+            Write-Host "第 $i 次安装失败 (exit=$LASTEXITCODE)"
+            if ($i -lt 3) { Write-Host "等待 30 秒后重试..."; Start-Sleep -Seconds 30 }
+          }
+
+          # 方案2: 直接从 GitHub Releases 下载
+          if (-not $installed) {
+            Write-Host "choco 安装失败，尝试从 GitHub Releases 直接下载..."
+            try {
+              $release = Invoke-RestMethod "https://api.github.com/repos/mozilla/sccache/releases/latest"
+              $asset = $release.assets | Where-Object {
+                $_.name -match "x86_64-pc-windows-msvc" -and $_.name -match "\.zip$"
+              } | Select-Object -First 1
+              if ($asset) {
+                Write-Host "下载: $($asset.browser_download_url)"
+                $zipPath = "D:\temp\sccache.zip"
+                $binDir  = "D:\temp\sccache-bin"
+                Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath -UseBasicParsing
+                Expand-Archive -Path $zipPath -DestinationPath $binDir -Force
+                $sccacheExe = Get-ChildItem -Path $binDir -Filter "sccache.exe" -Recurse | Select-Object -First 1
+                if ($sccacheExe) {
+                  echo "$($sccacheExe.DirectoryName)" >> $env:GITHUB_PATH
+                  & "$($sccacheExe.FullName)" --version
+                  if ($LASTEXITCODE -eq 0) {
+                    Write-Host "GitHub Releases 安装成功"
+                    $installed = $true
+                  }
+                }
+              } else {
+                Write-Host "未找到 Windows x86_64 资产"
+              }
+            } catch {
+              Write-Host "GitHub Releases 下载失败: $_"
+            }
+          }
+
+          if ($installed) {
+            echo "SCCACHE_AVAILABLE=true" >> $env:GITHUB_ENV
+            Write-Host "✓ sccache 可用，将启用编译缓存"
+          } else {
+            echo "SCCACHE_AVAILABLE=false" >> $env:GITHUB_ENV
+            Write-Host "⚠ sccache 所有安装方式均失败，将不使用编译缓存"
+          }
 
       - name: 恢复 sccache 缓存
+        if: env.SCCACHE_AVAILABLE == 'true'
         uses: actions/cache/restore@v4
         with:
           path: |
             D:\c\sccache
             D:\c\registry
             D:\c\git
-          key: sccache-win
+          key: sccache-windows-x86_64
+          restore-keys: sccache-win
 
       - name: 启动 sccache server
+        if: env.SCCACHE_AVAILABLE == 'true'
         run: |
           sccache --start-server
           sccache --zero-stats
@@ -262,9 +319,17 @@ jobs:
       - name: 构建 Release (带重试)
         shell: pwsh
         env:
-          RUSTC_WRAPPER: sccache
           RELEASE_CHANNEL: stable
         run: |
+          # 根据 sccache 可用性决定是否启用缓存
+          if ($env:SCCACHE_AVAILABLE -eq "true") {
+            $env:RUSTC_WRAPPER = "sccache"
+            Write-Host "已启用 sccache 编译缓存"
+          } else {
+            $env:RUSTC_WRAPPER = ""
+            Write-Host "⚠ sccache 不可用，直接编译（无缓存加速）"
+          }
+
           # 启动内存监控后台任务
           $monitorJob = Start-Job -ScriptBlock {
               $log = "D:\mem_monitor.csv"
@@ -311,6 +376,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: 停止 sccache
+        if: env.SCCACHE_AVAILABLE == 'true'
         shell: pwsh
         run: |
           Write-Host ""
@@ -335,22 +401,22 @@ jobs:
           sccache --stop-server || $true
 
       - name: 清理旧缓存
-        if: always()
+        if: always() && env.SCCACHE_AVAILABLE == 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
-        run: gh api -X DELETE "repos/${{ github.repository }}/actions/caches?key=sccache-win"
+        run: gh api -X DELETE "repos/${{ github.repository }}/actions/caches?key=sccache-windows-x86_64"
 
       - name: 保存 sccache 缓存
-        if: always()
+        if: always() && env.SCCACHE_AVAILABLE == 'true'
         uses: actions/cache/save@v4
         with:
           path: |
             D:\c\sccache
             D:\c\registry
             D:\c\git
-          key: sccache-win
+          key: sccache-windows-x86_64
 
       - name: 打包 Windows
         shell: pwsh
@@ -389,7 +455,18 @@ jobs:
           swap-storage: false
 
       - name: 安装 sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@v0.0.3
+
+      - name: 检查 sccache 可用性
+        run: |
+          if command -v sccache &>/dev/null && sccache --version &>/dev/null; then
+            echo "SCCACHE_AVAILABLE=true" >> "$GITHUB_ENV"
+            echo "✓ sccache 可用，将启用编译缓存"
+          else
+            echo "SCCACHE_AVAILABLE=false" >> "$GITHUB_ENV"
+            echo "⚠ sccache 不可用，将不使用编译缓存"
+          fi
 
       - name: 安装依赖
         run: |
@@ -422,18 +499,20 @@ jobs:
           git apply ../l10n.patch
 
       - name: 恢复 sccache 缓存
+        if: env.SCCACHE_AVAILABLE == 'true'
         uses: actions/cache/restore@v4
         with:
           path: |
             /home/runner/.cache/sccache
             ~/.cargo/registry
             ~/.cargo/git
-          key: sccache-linux
-
+          key: sccache-linux-x86_64
+          restore-keys: sccache-linux
       - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
 
       - name: 启动 sccache
+        if: env.SCCACHE_AVAILABLE == 'true'
         run: |
           sccache --stop-server || true
           sccache --start-server
@@ -442,9 +521,17 @@ jobs:
 
       - name: 构建 Release
         env:
-          RUSTC_WRAPPER: sccache
           RELEASE_CHANNEL: stable
         run: |
+          # 根据 sccache 可用性决定是否启用缓存
+          if [ "$SCCACHE_AVAILABLE" = "true" ]; then
+            export RUSTC_WRAPPER=sccache
+            echo "已启用 sccache 编译缓存"
+          else
+            export RUSTC_WRAPPER=""
+            echo "⚠ sccache 不可用，直接编译（无缓存加速）"
+          fi
+
           # 启动内存监控后台进程
           MEM_LOG="/tmp/mem_monitor.csv"
           echo "timestamp,used_mb,total_mb,swap_used_mb,swap_total_mb" > "$MEM_LOG"
@@ -483,6 +570,7 @@ jobs:
           exit $BUILD_EXIT
 
       - name: 停止 sccache
+        if: env.SCCACHE_AVAILABLE == 'true'
         run: |
           echo ""
           echo "========================================="
@@ -506,22 +594,21 @@ jobs:
           sccache --stop-server || true
 
       - name: 清理旧缓存
-        if: always()
+        if: always() && env.SCCACHE_AVAILABLE == 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh api -X DELETE "repos/${{ github.repository }}/actions/caches?key=sccache-linux"
 
       - name: 保存 sccache 缓存
-        if: always()
+        if: always() && env.SCCACHE_AVAILABLE == 'true'
         uses: actions/cache/save@v4
         with:
           path: |
             /home/runner/.cache/sccache
             ~/.cargo/registry
             ~/.cargo/git
-          key: sccache-linux
-
+          key: sccache-linux-x86_64
       - name: 打包 Linux
         run: |
           # === tar.gz 包 ===
@@ -586,9 +673,9 @@ jobs:
             zedg-${{ env.LANG_LOWER }}-linux-x86_64-${{ env.BUILD_VERSION }}.deb
 
   # ===========================================================================
-  # 5. macOS 构建
+  # 5a. macOS aarch64 编译（Apple Silicon）
   # ===========================================================================
-  build-macos:
+  build-macos-aarch64:
     needs: [versioning, prepare]
     if: ${{ needs.versioning.outputs.should_release == 'true' }}
     runs-on: macos-latest
@@ -596,16 +683,24 @@ jobs:
       SCCACHE_DIR: /Users/runner/Library/Caches/Mozilla.sccache
       SCCACHE_IDLE_TIMEOUT: "0"
       BUILD_VERSION: ${{ needs.versioning.outputs.upstream_version }}
-      LANG_LOWER: ${{ needs.versioning.outputs.lang_lower }}
     steps:
       - name: 安装 sccache
+        continue-on-error: true
         uses: mozilla-actions/sccache-action@v0.0.3
+
+      - name: 检查 sccache 可用性
+        run: |
+          if command -v sccache &>/dev/null && sccache --version &>/dev/null; then
+            echo "SCCACHE_AVAILABLE=true" >> "$GITHUB_ENV"
+          else
+            echo "SCCACHE_AVAILABLE=false" >> "$GITHUB_ENV"
+            echo "⚠ sccache 不可用，将不使用编译缓存"
+          fi
 
       - name: 克隆 Zed 源码并检出 Tag
         run: |
           git clone ${{ env.ZED_REPO }} zed
-          cd zed
-          git checkout $BUILD_VERSION
+          cd zed && git checkout $BUILD_VERSION
 
       - name: 下载本地化补丁
         uses: actions/download-artifact@v4
@@ -613,18 +708,18 @@ jobs:
           name: l10n-patch
 
       - name: 应用本地化补丁
-        run: |
-          cd zed
-          git apply ../l10n.patch
+        run: cd zed && git apply ../l10n.patch
 
       - name: 恢复 sccache 缓存
+        if: env.SCCACHE_AVAILABLE == 'true'
         uses: actions/cache/restore@v4
         with:
           path: |
             /Users/runner/Library/Caches/Mozilla.sccache
             ~/.cargo/registry
             ~/.cargo/git
-          key: sccache-macos
+          key: sccache-macos-aarch64
+          restore-keys: sccache-macos
 
       - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
@@ -632,18 +727,19 @@ jobs:
           targets: aarch64-apple-darwin
 
       - name: 启动 sccache
-        run: |
-          sccache --start-server
-          sccache --zero-stats
+        if: env.SCCACHE_AVAILABLE == 'true'
+        run: sccache --start-server && sccache --zero-stats
 
-      - name: 构建 macOS Release
+      - name: 构建 aarch64
         env:
-          RUSTC_WRAPPER: sccache
           RELEASE_CHANNEL: stable
         run: |
-          cd zed
+          if [ "$SCCACHE_AVAILABLE" = "true" ]; then
+            export RUSTC_WRAPPER=sccache
+          else
+            export RUSTC_WRAPPER=""
+          fi
 
-          # 启动内存监控后台进程
           MEM_LOG="/tmp/mem_monitor.csv"
           echo "timestamp,used_mb,total_mb,swap_used_mb,swap_total_mb" > "$MEM_LOG"
           (
@@ -663,32 +759,256 @@ jobs:
           ) &
           MONITOR_PID=$!
 
-          cargo build --release --target aarch64-apple-darwin --jobs 4 --locked
+          cd zed && cargo build --release --target aarch64-apple-darwin --jobs 4 --locked
           BUILD_EXIT=$?
 
-          # 停止监控并输出摘要
           kill $MONITOR_PID 2>/dev/null || true
-          echo "===== 内存监控摘要 ====="
           PEAK_MEM=$(tail -n +2 "$MEM_LOG" | cut -d, -f2 | sort -n | tail -1)
           PEAK_SWAP=$(tail -n +2 "$MEM_LOG" | cut -d, -f4 | sort -n | tail -1)
           TOTAL_MEM=$(tail -n +2 "$MEM_LOG" | head -1 | cut -d, -f3)
-          TOTAL_SWAP=$(tail -n +2 "$MEM_LOG" | head -1 | cut -d, -f5)
           SAMPLES=$(tail -n +2 "$MEM_LOG" | wc -l)
+          echo "===== 内存监控摘要 ====="
           echo "物理内存: 峰值 ${PEAK_MEM}MB / 总计 ${TOTAL_MEM}MB"
-          echo "交换内存: 峰值 ${PEAK_SWAP}MB / 总计 ${TOTAL_SWAP}MB"
-          if [ "${PEAK_SWAP:-0}" -gt 0 ] 2>/dev/null; then echo "⚠ 编译期间使用了交换内存!"; fi
+          echo "交换内存: 峰值 ${PEAK_SWAP}MB"
           echo "采样记录数: $SAMPLES"
+          exit $BUILD_EXIT
 
-          if [ $BUILD_EXIT -ne 0 ]; then exit $BUILD_EXIT; fi
+      - name: 停止 sccache
+        if: env.SCCACHE_AVAILABLE == 'true'
+        run: |
+          echo "========================================="
+          echo "         sccache 编译缓存统计 (aarch64)"
+          echo "========================================="
+          sccache --show-stats
+          HITS=$(sccache --show-stats 2>&1 | awk '/^Cache hits /{print $NF}' | head -1)
+          MISSES=$(sccache --show-stats 2>&1 | awk '/^Cache misses /{print $NF}' | head -1)
+          HITS=${HITS:-0}; MISSES=${MISSES:-0}; TOTAL=$((HITS + MISSES))
+          if [ "$TOTAL" -gt 0 ]; then
+            RATE=$(awk "BEGIN {printf \"%.1f\", $HITS/$TOTAL*100}")
+            echo ">>> 缓存命中: $HITS / $TOTAL ($RATE%)"
+          fi
+          echo "========================================="
+          sccache --stop-server || true
+
+      - name: 清理旧缓存
+        if: always() && env.SCCACHE_AVAILABLE == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X DELETE "repos/${{ github.repository }}/actions/caches?key=sccache-macos-aarch64"
+
+      - name: 保存 sccache 缓存
+        if: always() && env.SCCACHE_AVAILABLE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /Users/runner/Library/Caches/Mozilla.sccache
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: sccache-macos-aarch64
+
+      - name: 暂存图标资源
+        run: |
+          mkdir -p macos-resources
+          cp zed/crates/zed/resources/app-icon.png macos-resources/
+          cp zed/crates/zed/resources/app-icon@2x.png macos-resources/
+          cp zed/crates/zed/resources/Document.icns macos-resources/ 2>/dev/null || true
+
+      - name: 上传 aarch64 二进制
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-macos-aarch64-bin
+          path: zed/target/aarch64-apple-darwin/release/zed
+
+      - name: 上传图标资源
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-macos-resources
+          path: macos-resources/
+
+  # ===========================================================================
+  # 5b. macOS x86_64 编译（Intel）
+  # ===========================================================================
+  build-macos-x86_64:
+    needs: [versioning, prepare]
+    if: ${{ needs.versioning.outputs.should_release == 'true' }}
+    runs-on: macos-15-intel
+    env:
+      SCCACHE_DIR: /Users/runner/Library/Caches/Mozilla.sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
+      BUILD_VERSION: ${{ needs.versioning.outputs.upstream_version }}
+    steps:
+      - name: 安装 sccache
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@v0.0.3
+
+      - name: 检查 sccache 可用性
+        run: |
+          if command -v sccache &>/dev/null && sccache --version &>/dev/null; then
+            echo "SCCACHE_AVAILABLE=true" >> "$GITHUB_ENV"
+          else
+            echo "SCCACHE_AVAILABLE=false" >> "$GITHUB_ENV"
+            echo "⚠ sccache 不可用，将不使用编译缓存"
+          fi
+
+      - name: 克隆 Zed 源码并检出 Tag
+        run: |
+          git clone ${{ env.ZED_REPO }} zed
+          cd zed && git checkout $BUILD_VERSION
+
+      - name: 下载本地化补丁
+        uses: actions/download-artifact@v4
+        with:
+          name: l10n-patch
+
+      - name: 应用本地化补丁
+        run: cd zed && git apply ../l10n.patch
+
+      - name: 恢复 sccache 缓存
+        if: env.SCCACHE_AVAILABLE == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /Users/runner/Library/Caches/Mozilla.sccache
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: sccache-macos-x86_64
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: 启动 sccache
+        if: env.SCCACHE_AVAILABLE == 'true'
+        run: sccache --start-server && sccache --zero-stats
+
+      - name: 构建 x86_64
+        env:
+          RELEASE_CHANNEL: stable
+        run: |
+          if [ "$SCCACHE_AVAILABLE" = "true" ]; then
+            export RUSTC_WRAPPER=sccache
+          else
+            export RUSTC_WRAPPER=""
+          fi
+
+          MEM_LOG="/tmp/mem_monitor.csv"
+          echo "timestamp,used_mb,total_mb,swap_used_mb,swap_total_mb" > "$MEM_LOG"
+          (
+            TOTAL_MB=$(( $(sysctl -n hw.memsize) / 1024 / 1024 ))
+            PAGE_SIZE=$(vm_stat | head -1 | grep -oE '[0-9]+')
+            while true; do
+              FREE_PAGES=$(vm_stat | awk '/Pages free/ {print $NF}' | tr -d '.')
+              INACTIVE_PAGES=$(vm_stat | awk '/Pages inactive/ {print $NF}' | tr -d '.')
+              SPECULATIVE_PAGES=$(vm_stat | awk '/Pages speculative/ {print $NF}' | tr -d '.')
+              AVAIL_MB=$(( (${FREE_PAGES:-0} + ${INACTIVE_PAGES:-0} + ${SPECULATIVE_PAGES:-0}) * PAGE_SIZE / 1024 / 1024 ))
+              USED_MB=$(( TOTAL_MB - AVAIL_MB ))
+              SWAP_USED_MB=$(sysctl -n vm.swapusage | awk -F'[= ]+' '{for(i=1;i<=NF;i++) if($i=="used") printf "%d", $(i+1)}')
+              SWAP_TOTAL_MB=$(sysctl -n vm.swapusage | awk -F'[= ]+' '{for(i=1;i<=NF;i++) if($i=="total") printf "%d", $(i+1)}')
+              echo "$(date +%H:%M:%S),$USED_MB,$TOTAL_MB,${SWAP_USED_MB:-0},${SWAP_TOTAL_MB:-0}" >> "$MEM_LOG"
+              sleep 10
+            done
+          ) &
+          MONITOR_PID=$!
+
+          cd zed && cargo build --release --target x86_64-apple-darwin --jobs 4 --locked
+          BUILD_EXIT=$?
+
+          kill $MONITOR_PID 2>/dev/null || true
+          PEAK_MEM=$(tail -n +2 "$MEM_LOG" | cut -d, -f2 | sort -n | tail -1)
+          PEAK_SWAP=$(tail -n +2 "$MEM_LOG" | cut -d, -f4 | sort -n | tail -1)
+          TOTAL_MEM=$(tail -n +2 "$MEM_LOG" | head -1 | cut -d, -f3)
+          SAMPLES=$(tail -n +2 "$MEM_LOG" | wc -l)
+          echo "===== 内存监控摘要 ====="
+          echo "物理内存: 峰值 ${PEAK_MEM}MB / 总计 ${TOTAL_MEM}MB"
+          echo "交换内存: 峰值 ${PEAK_SWAP}MB"
+          echo "采样记录数: $SAMPLES"
+          exit $BUILD_EXIT
+
+      - name: 停止 sccache
+        if: env.SCCACHE_AVAILABLE == 'true'
+        run: |
+          echo "========================================="
+          echo "         sccache 编译缓存统计 (x86_64)"
+          echo "========================================="
+          sccache --show-stats
+          HITS=$(sccache --show-stats 2>&1 | awk '/^Cache hits /{print $NF}' | head -1)
+          MISSES=$(sccache --show-stats 2>&1 | awk '/^Cache misses /{print $NF}' | head -1)
+          HITS=${HITS:-0}; MISSES=${MISSES:-0}; TOTAL=$((HITS + MISSES))
+          if [ "$TOTAL" -gt 0 ]; then
+            RATE=$(awk "BEGIN {printf \"%.1f\", $HITS/$TOTAL*100}")
+            echo ">>> 缓存命中: $HITS / $TOTAL ($RATE%)"
+          fi
+          echo "========================================="
+          sccache --stop-server || true
+
+      - name: 清理旧缓存
+        if: always() && env.SCCACHE_AVAILABLE == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X DELETE "repos/${{ github.repository }}/actions/caches?key=sccache-macos-x86_64"
+
+      - name: 保存 sccache 缓存
+        if: always() && env.SCCACHE_AVAILABLE == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /Users/runner/Library/Caches/Mozilla.sccache
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: sccache-macos-x86_64
+
+      - name: 上传 x86_64 二进制
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-macos-x86_64-bin
+          path: zed/target/x86_64-apple-darwin/release/zed
+
+  # ===========================================================================
+  # 5c. macOS 合并打包（Universal Binary + DMG）
+  # ===========================================================================
+  build-macos:
+    needs: [versioning, build-macos-aarch64, build-macos-x86_64]
+    if: ${{ needs.versioning.outputs.should_release == 'true' }}
+    runs-on: macos-latest
+    env:
+      BUILD_VERSION: ${{ needs.versioning.outputs.upstream_version }}
+      LANG_LOWER: ${{ needs.versioning.outputs.lang_lower }}
+    steps:
+      - name: 下载 aarch64 二进制
+        uses: actions/download-artifact@v4
+        with:
+          name: zed-macos-aarch64-bin
+          path: bins/aarch64
+
+      - name: 下载 x86_64 二进制
+        uses: actions/download-artifact@v4
+        with:
+          name: zed-macos-x86_64-bin
+          path: bins/x86_64
+
+      - name: 下载图标资源
+        uses: actions/download-artifact@v4
+        with:
+          name: zed-macos-resources
+          path: resources
+
+      - name: 合并 Universal Binary 并打包 DMG
+        run: |
+          chmod +x bins/aarch64/zed bins/x86_64/zed
+          lipo -create bins/aarch64/zed bins/x86_64/zed -output zed-universal
+          echo "Universal binary 架构: $(lipo -archs zed-universal)"
 
           APP_NAME="ZedG.app"
           mkdir -p "$APP_NAME/Contents/MacOS" "$APP_NAME/Contents/Resources"
-          cp "target/aarch64-apple-darwin/release/zed" "$APP_NAME/Contents/MacOS/zed"
+          cp zed-universal "$APP_NAME/Contents/MacOS/zed"
 
           # === 生成应用图标 (PNG -> ICNS) ===
           ICONSET_DIR="AppIcon.iconset"
           mkdir -p "$ICONSET_DIR"
-          ICON_SRC="crates/zed/resources/app-icon@2x.png"
+          ICON_SRC="resources/app-icon@2x.png"
           if [ -f "$ICON_SRC" ]; then
             sips -z 16 16     "$ICON_SRC" --out "$ICONSET_DIR/icon_16x16.png"
             sips -z 32 32     "$ICON_SRC" --out "$ICONSET_DIR/icon_16x16@2x.png"
@@ -699,16 +1019,15 @@ jobs:
             sips -z 256 256   "$ICON_SRC" --out "$ICONSET_DIR/icon_256x256.png"
             sips -z 512 512   "$ICON_SRC" --out "$ICONSET_DIR/icon_256x256@2x.png"
             sips -z 512 512   "$ICON_SRC" --out "$ICONSET_DIR/icon_512x512.png"
-            cp "$ICON_SRC"                       "$ICONSET_DIR/icon_512x512@2x.png"
+            cp "$ICON_SRC"         "$ICONSET_DIR/icon_512x512@2x.png"
             iconutil -c icns "$ICONSET_DIR" -o "$APP_NAME/Contents/Resources/AppIcon.icns"
             echo "应用图标已生成"
           else
             echo "未找到图标源文件 $ICON_SRC"
           fi
 
-          # === 复制 Document 图标 ===
-          if [ -f "crates/zed/resources/Document.icns" ]; then
-            cp "crates/zed/resources/Document.icns" "$APP_NAME/Contents/Resources/"
+          if [ -f "resources/Document.icns" ]; then
+            cp resources/Document.icns "$APP_NAME/Contents/Resources/"
           fi
 
           cat > "$APP_NAME/Contents/Info.plist" <<EOF
@@ -732,34 +1051,160 @@ jobs:
           </plist>
           EOF
 
-          # === 创建 DMG 暂存目录（含 Applications 快捷方式）===
           DMG_STAGING="dmg-staging"
           mkdir -p "$DMG_STAGING"
           mv "$APP_NAME" "$DMG_STAGING/"
           ln -s /Applications "$DMG_STAGING/Applications"
 
-          # === 等待文件系统并重试 hdiutil ===
-          echo "编译完成，等待文件系统稳定 (10s)..."
+          echo "等待文件系统稳定 (10s)..."
           sleep 10
-
           echo "开始打包 DMG..."
           n=0
-          until [ "$n" -ge 10 ]
-          do
-              hdiutil create -volname ZedG -srcfolder "$DMG_STAGING" -ov -format UDZO "zedg-${LANG_LOWER}-macos-aarch64-${BUILD_VERSION}.dmg" && break
-              n=$((n+1))
-              echo "hdiutil 失败 (Resource busy?), 等待 15秒后重试 ($n/10)..."
-              sleep 15
+          until [ "$n" -ge 10 ]; do
+            hdiutil create -volname ZedG -srcfolder "$DMG_STAGING" -ov -format UDZO \
+              "zedg-${LANG_LOWER}-macos-universal-${BUILD_VERSION}.dmg" && break
+            n=$((n+1))
+            echo "hdiutil 失败 (Resource busy?), 等待 15 秒后重试 ($n/10)..."
+            sleep 15
           done
 
-          if [ ! -f "zedg-${LANG_LOWER}-macos-aarch64-${BUILD_VERSION}.dmg" ]; then
-              echo "最终打包失败，退出。"
-              exit 1
+          if [ ! -f "zedg-${LANG_LOWER}-macos-universal-${BUILD_VERSION}.dmg" ]; then
+            echo "最终打包失败，退出。"; exit 1
           fi
 
-          mv "zedg-${LANG_LOWER}-macos-aarch64-${BUILD_VERSION}.dmg" ../
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-macos
+          path: zedg-${{ env.LANG_LOWER }}-macos-universal-${{ env.BUILD_VERSION }}.dmg
+
+  # ===========================================================================
+  # 5d. Linux ARM64 构建
+  # ===========================================================================
+  build-linux-arm64:
+    needs: [versioning, prepare]
+    if: ${{ needs.versioning.outputs.should_release == 'true' }}
+    runs-on: ubuntu-24.04-arm
+    env:
+      SCCACHE_DIR: /home/runner/.cache/sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
+      BUILD_VERSION: ${{ needs.versioning.outputs.upstream_version }}
+      LANG_LOWER: ${{ needs.versioning.outputs.lang_lower }}
+    steps:
+      - name: 安装 sccache
+        continue-on-error: true
+        uses: mozilla-actions/sccache-action@v0.0.3
+
+      - name: 检查 sccache 可用性
+        run: |
+          if command -v sccache &>/dev/null && sccache --version &>/dev/null; then
+            echo "SCCACHE_AVAILABLE=true" >> "$GITHUB_ENV"
+            echo "✓ sccache 可用，将启用编译缓存"
+          else
+            echo "SCCACHE_AVAILABLE=false" >> "$GITHUB_ENV"
+            echo "⚠ sccache 不可用，将不使用编译缓存"
+          fi
+
+      - name: 安装依赖
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential pkg-config python3 libasound2-dev \
+            libx11-dev libx11-xcb-dev libxkbfile-dev libgtk-3-dev \
+            libxcb-xinput-dev libwayland-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xinerama0-dev \
+            libxcb-randr0-dev libxcb-keysyms1-dev libxcb-util-dev \
+            libgl1-mesa-dev libegl1-mesa-dev libfreetype6-dev libfontconfig1-dev \
+            libssl-dev libudev-dev libclang-dev clang cmake binutils-gold
+          echo "RUSTFLAGS=-C link-arg=-fuse-ld=gold -Clink-arg=-Wl,--no-threads" >> $GITHUB_ENV
+
+      - name: 克隆 Zed 源码并检出 Tag
+        run: |
+          git clone ${{ env.ZED_REPO }} zed
+          cd zed
+          git checkout $BUILD_VERSION
+          echo "Checked out $BUILD_VERSION"
+
+      - name: 下载本地化补丁
+        uses: actions/download-artifact@v4
+        with:
+          name: l10n-patch
+
+      - name: 应用本地化补丁
+        run: |
+          cd zed
+          git apply ../l10n.patch
+
+      - name: 恢复 sccache 缓存
+        if: env.SCCACHE_AVAILABLE == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /home/runner/.cache/sccache
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: sccache-linux-aarch64
+          restore-keys: sccache-linux-arm64
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 启动 sccache
+        if: env.SCCACHE_AVAILABLE == 'true'
+        run: |
+          sccache --stop-server || true
+          sccache --start-server
+          sccache --zero-stats
+          sccache -s
+
+      - name: 构建 Release
+        env:
+          RELEASE_CHANNEL: stable
+        run: |
+          if [ "$SCCACHE_AVAILABLE" = "true" ]; then
+            export RUSTC_WRAPPER=sccache
+            echo "已启用 sccache 编译缓存"
+          else
+            export RUSTC_WRAPPER=""
+            echo "⚠ sccache 不可用，直接编译（无缓存加速）"
+          fi
+
+          MEM_LOG="/tmp/mem_monitor.csv"
+          echo "timestamp,used_mb,total_mb,swap_used_mb,swap_total_mb" > "$MEM_LOG"
+          (
+            while true; do
+              TOTAL_MB=$(($(awk '/^MemTotal:/{print $2}' /proc/meminfo) / 1024))
+              AVAIL_MB=$(($(awk '/^MemAvailable:/{print $2}' /proc/meminfo) / 1024))
+              USED_MB=$((TOTAL_MB - AVAIL_MB))
+              SWAP_TOTAL_MB=$(($(awk '/^SwapTotal:/{print $2}' /proc/meminfo) / 1024))
+              SWAP_FREE_MB=$(($(awk '/^SwapFree:/{print $2}' /proc/meminfo) / 1024))
+              SWAP_USED_MB=$((SWAP_TOTAL_MB - SWAP_FREE_MB))
+              echo "$(date +%H:%M:%S),$USED_MB,$TOTAL_MB,$SWAP_USED_MB,$SWAP_TOTAL_MB" >> "$MEM_LOG"
+              sleep 10
+            done
+          ) &
+          MONITOR_PID=$!
+
+          cd zed
+          cargo build --release --jobs 4 --locked
+          BUILD_EXIT=$?
+
+          kill $MONITOR_PID 2>/dev/null || true
+          echo "===== 内存监控摘要 ====="
+          PEAK_MEM=$(tail -n +2 "$MEM_LOG" | cut -d, -f2 | sort -n | tail -1)
+          PEAK_SWAP=$(tail -n +2 "$MEM_LOG" | cut -d, -f4 | sort -n | tail -1)
+          TOTAL_MEM=$(tail -n +2 "$MEM_LOG" | head -1 | cut -d, -f3)
+          TOTAL_SWAP=$(tail -n +2 "$MEM_LOG" | head -1 | cut -d, -f5)
+          SAMPLES=$(tail -n +2 "$MEM_LOG" | wc -l)
+          echo "物理内存: 峰值 ${PEAK_MEM}MB / 总计 ${TOTAL_MEM}MB"
+          echo "交换内存: 峰值 ${PEAK_SWAP}MB / 总计 ${TOTAL_SWAP}MB"
+          if [ "$PEAK_SWAP" -gt 0 ] 2>/dev/null; then echo "⚠ 编译期间使用了交换内存!"; fi
+          echo "采样记录数: $SAMPLES"
+
+          exit $BUILD_EXIT
 
       - name: 停止 sccache
+        if: env.SCCACHE_AVAILABLE == 'true'
         run: |
           echo ""
           echo "========================================="
@@ -783,34 +1228,89 @@ jobs:
           sccache --stop-server || true
 
       - name: 清理旧缓存
-        if: always()
+        if: always() && env.SCCACHE_AVAILABLE == 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh api -X DELETE "repos/${{ github.repository }}/actions/caches?key=sccache-macos"
+        run: gh api -X DELETE "repos/${{ github.repository }}/actions/caches?key=sccache-linux-aarch64"
 
       - name: 保存 sccache 缓存
-        if: always()
+        if: always() && env.SCCACHE_AVAILABLE == 'true'
         uses: actions/cache/save@v4
         with:
           path: |
-            /Users/runner/Library/Caches/Mozilla.sccache
+            /home/runner/.cache/sccache
             ~/.cargo/registry
             ~/.cargo/git
-          key: sccache-macos
+          key: sccache-linux-aarch64
+
+      - name: 打包 Linux ARM64
+        run: |
+          mkdir -p dist/usr/bin
+          mkdir -p dist/usr/share/applications
+          mkdir -p dist/usr/share/icons/hicolor/512x512/apps
+          mkdir -p dist/usr/share/icons/hicolor/1024x1024/apps
+          cp "zed/target/release/zed" dist/usr/bin/zedg
+
+          cp zed/crates/zed/resources/app-icon.png \
+             dist/usr/share/icons/hicolor/512x512/apps/zedg.png
+          cp zed/crates/zed/resources/app-icon@2x.png \
+             dist/usr/share/icons/hicolor/1024x1024/apps/zedg.png
+
+          cat > dist/usr/share/applications/zedg.desktop <<DESKTOP
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=ZedG
+          GenericName=Text Editor
+          Comment=A high-performance, multiplayer code editor with globalization support.
+          TryExec=zedg
+          StartupNotify=true
+          Exec=zedg %F
+          Icon=zedg
+          Categories=Utility;TextEditor;Development;IDE;
+          Keywords=zed;
+          MimeType=text/plain;
+          DESKTOP
+
+          tar -czvf "zedg-${LANG_LOWER}-linux-aarch64-${BUILD_VERSION}.tar.gz" -C dist .
+
+          mkdir -p deb-pkg/DEBIAN deb-pkg/usr/bin
+          mkdir -p deb-pkg/usr/share/applications
+          mkdir -p deb-pkg/usr/share/icons/hicolor/512x512/apps
+          mkdir -p deb-pkg/usr/share/icons/hicolor/1024x1024/apps
+          cp "zed/target/release/zed" deb-pkg/usr/bin/zedg
+          cp dist/usr/share/applications/zedg.desktop deb-pkg/usr/share/applications/
+          cp dist/usr/share/icons/hicolor/512x512/apps/zedg.png \
+             deb-pkg/usr/share/icons/hicolor/512x512/apps/
+          cp dist/usr/share/icons/hicolor/1024x1024/apps/zedg.png \
+             deb-pkg/usr/share/icons/hicolor/1024x1024/apps/
+
+          RAW_VERSION="${{ needs.versioning.outputs.upstream_version }}"
+          CLEAN_VERSION="${RAW_VERSION#v}"
+          cat > deb-pkg/DEBIAN/control <<CTRL
+          Package: zedg
+          Version: $CLEAN_VERSION
+          Architecture: arm64
+          Maintainer: zed-globalization
+          Description: Zed editor with globalization support.
+          CTRL
+          dpkg-deb --build deb-pkg "zedg-${LANG_LOWER}-linux-aarch64-${BUILD_VERSION}.deb"
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: zed-macos
-          path: zedg-${{ env.LANG_LOWER }}-macos-aarch64-${{ env.BUILD_VERSION }}.dmg
+          name: zed-linux-arm64
+          path: |
+            zedg-${{ env.LANG_LOWER }}-linux-aarch64-${{ env.BUILD_VERSION }}.tar.gz
+            zedg-${{ env.LANG_LOWER }}-linux-aarch64-${{ env.BUILD_VERSION }}.deb
 
   # ===========================================================================
   # 6. 正式发布
   # ===========================================================================
   release:
     runs-on: ubuntu-latest
-    needs: [versioning, build-windows, build-linux, build-macos]
+    needs: [versioning, build-windows, build-linux, build-linux-arm64, build-macos]
     if: ${{ needs.versioning.outputs.should_release == 'true' }}
     env:
       LANG_LOWER: ${{ needs.versioning.outputs.lang_lower }}
@@ -852,9 +1352,11 @@ jobs:
         run: |
           mkdir release-dist
           mv "artifacts/zed-windows/zedg-${LANG_LOWER}-windows-x86_64-${BUILD_VERSION}.zip" release-dist/ || echo "No Windows artifact"
-          mv "artifacts/zed-linux/zedg-${LANG_LOWER}-linux-x86_64-${BUILD_VERSION}.tar.gz" release-dist/ || echo "No Linux tar artifact"
-          mv "artifacts/zed-linux/zedg-${LANG_LOWER}-linux-x86_64-${BUILD_VERSION}.deb" release-dist/ || echo "No Linux deb artifact"
-          mv "artifacts/zed-macos/zedg-${LANG_LOWER}-macos-aarch64-${BUILD_VERSION}.dmg" release-dist/ || echo "No macOS artifact"
+          mv "artifacts/zed-linux/zedg-${LANG_LOWER}-linux-x86_64-${BUILD_VERSION}.tar.gz" release-dist/ || echo "No Linux x86_64 tar artifact"
+          mv "artifacts/zed-linux/zedg-${LANG_LOWER}-linux-x86_64-${BUILD_VERSION}.deb" release-dist/ || echo "No Linux x86_64 deb artifact"
+          mv "artifacts/zed-linux-arm64/zedg-${LANG_LOWER}-linux-aarch64-${BUILD_VERSION}.tar.gz" release-dist/ || echo "No Linux ARM64 tar artifact"
+          mv "artifacts/zed-linux-arm64/zedg-${LANG_LOWER}-linux-aarch64-${BUILD_VERSION}.deb" release-dist/ || echo "No Linux ARM64 deb artifact"
+          mv "artifacts/zed-macos/zedg-${LANG_LOWER}-macos-universal-${BUILD_VERSION}.dmg" release-dist/ || echo "No macOS artifact"
           mv "artifacts/l10n-patch/l10n.patch" "release-dist/zedg-${LANG_LOWER}-l10n-${BUILD_VERSION}.patch" || echo "No l10n patch"
           mv "artifacts/l10n-patch/l10n-source.tar.gz" "release-dist/zedg-${LANG_LOWER}-source-${BUILD_VERSION}.tar.gz" || echo "No l10n source"
 
