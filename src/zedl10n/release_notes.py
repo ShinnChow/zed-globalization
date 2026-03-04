@@ -140,31 +140,118 @@ def fetch_release_notes(version: str) -> str:
     return ""
 
 
+_MAX_CHUNK_CHARS = 5000
+_MAX_RETRIES = 3
+
+_SPLIT_PATTERNS = [
+    r"(?=^## )",   # 二级标题
+    r"(?=^### )",  # 三级标题
+    r"(?=^\n\n)",  # 空行段落
+]
+
+
+def _split_md(text: str, level: int = 0) -> list[str]:
+    """按 Markdown 结构逐级拆分，level 越大粒度越细"""
+    import re
+
+    if level >= len(_SPLIT_PATTERNS):
+        return [text] if text.strip() else []
+    parts = re.split(_SPLIT_PATTERNS[level], text, flags=re.MULTILINE)
+    return [p for p in parts if p.strip()]
+
+
+def _merge_chunks(sections: list[str], limit: int) -> list[str]:
+    """合并小段落到不超过 limit 的块"""
+    chunks: list[str] = []
+    buf: list[str] = []
+    buf_len = 0
+    for sec in sections:
+        if buf and buf_len + len(sec) > limit:
+            chunks.append("\n".join(buf))
+            buf, buf_len = [], 0
+        buf.append(sec)
+        buf_len += len(sec)
+    if buf:
+        chunks.append("\n".join(buf))
+    return chunks
+
+
+def _call_ai(
+    client: object, model: str, system: str, text: str,
+) -> str:
+    resp = client.chat.completions.create(  # type: ignore[attr-defined]
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": text},
+        ],
+        temperature=0,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+def _translate_with_retry(
+    chunk: str, lang: str, ai_cfg: AIConfig,
+    client: object, split_level: int = 0,
+) -> str:
+    """翻译单个块，失败重试 3 次；仍失败则拆更细再各重试 3 次"""
+    system = _SYSTEM_PROMPT.format(lang=lang)
+
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            result = _call_ai(client, ai_cfg.model, system, chunk)
+            if result:
+                return result
+        except Exception as e:
+            log.warning(
+                "翻译失败 (level=%d, 第%d次, %d字符): %s",
+                split_level, attempt, len(chunk), e,
+            )
+
+    next_level = split_level + 1
+    if next_level < len(_SPLIT_PATTERNS):
+        log.info("重试耗尽，拆分更细 (level %d→%d) 再翻译", split_level, next_level)
+        subs = _split_md(chunk, next_level)
+        sub_chunks = _merge_chunks(subs, _MAX_CHUNK_CHARS)
+        parts: list[str] = []
+        for sub in sub_chunks:
+            parts.append(
+                _translate_with_retry(sub, lang, ai_cfg, client, next_level),
+            )
+        return "\n\n".join(parts)
+
+    log.warning("所有重试与拆分均失败，回退使用原文 (%d 字符)", len(chunk))
+    return chunk
+
+
 def translate_notes(
     notes: str, lang: str, ai_cfg: AIConfig,
 ) -> str:
-    """调用 AI 翻译 Release Notes"""
+    """调用 AI 翻译 Release Notes，过长时按 Markdown 段落分批翻译"""
     from openai import OpenAI
 
     client = OpenAI(base_url=ai_cfg.base_url, api_key=ai_cfg.api_key)
-    system = _SYSTEM_PROMPT.format(lang=lang)
 
-    try:
-        resp = client.chat.completions.create(
-            model=ai_cfg.model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": notes},
-            ],
-            temperature=0,
-        )
-        result = (resp.choices[0].message.content or "").strip()
+    if len(notes) <= _MAX_CHUNK_CHARS:
+        result = _translate_with_retry(notes, lang, ai_cfg, client)
         if result:
             log.info("Release Notes 翻译完成 (%d 字符)", len(result))
-            return result
-    except Exception as e:
-        log.warning("翻译 Release Notes 失败: %s", e)
-    return ""
+        return result
+
+    log.info("Release Notes 过长 (%d 字符)，按段落分批翻译", len(notes))
+    sections = _split_md(notes, level=0)
+    chunks = _merge_chunks(sections, _MAX_CHUNK_CHARS)
+
+    translated: list[str] = []
+    for i, chunk in enumerate(chunks, 1):
+        log.info("翻译段落 %d/%d (%d 字符)", i, len(chunks), len(chunk))
+        translated.append(
+            _translate_with_retry(chunk, lang, ai_cfg, client),
+        )
+
+    final = "\n\n".join(translated)
+    log.info("分批翻译完成 (%d 段，%d 字符)", len(chunks), len(final))
+    return final
 
 
 def generate_release_body(

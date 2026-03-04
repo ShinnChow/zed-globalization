@@ -850,6 +850,7 @@ jobs:
           path: artifacts/arm64
 
       - name: 构建 MSI
+        continue-on-error: true
         shell: pwsh
         run: |
           $msiVer = ($env:BUILD_VERSION -replace '^v', '') -split '-' | Select-Object -First 1
@@ -862,9 +863,9 @@ jobs:
             Expand-Archive $ZipPath -DestinationPath "extracted\$Arch" -Force
             $exePath = Resolve-Path "extracted\$Arch\$ExeSubPath"
             candle -arch $Arch `
-              -dAppVersion=$msiVer `
+              "-dAppVersion=$msiVer" `
               "-dSourceExe=$exePath" `
-              -dUpgradeCode=$UpgradeCode `
+              "-dUpgradeCode=$UpgradeCode" `
               .github\installer\zedg.wxs `
               -o "$Arch.wixobj"
             light "$Arch.wixobj" -o $OutFile
@@ -885,6 +886,7 @@ jobs:
             -OutFile "zedg-$env:LANG_LOWER-windows-aarch64-$env:BUILD_VERSION.msi"
 
       - name: 上传 MSI 产物
+        if: hashFiles('*.msi') != ''
         uses: actions/upload-artifact@v4
         with:
           name: zed-windows-msi
@@ -2082,7 +2084,15 @@ jobs:
   release:
     runs-on: ubuntu-latest
     needs: [versioning, build-windows-x86_64, build-windows-aarch64, build-windows-msi, build-linux-x86_64, build-linux-aarch64, build-macos-universal]
-    if: ${{ needs.versioning.outputs.should_release == 'true' }}
+    if: >-
+      always() &&
+      needs.versioning.outputs.should_release == 'true' &&
+      needs.versioning.result == 'success' &&
+      needs.build-windows-x86_64.result == 'success' &&
+      needs.build-windows-aarch64.result == 'success' &&
+      needs.build-linux-x86_64.result == 'success' &&
+      needs.build-linux-aarch64.result == 'success' &&
+      needs.build-macos-universal.result == 'success'
     env:
       LANG_LOWER: ${{ needs.versioning.outputs.lang_lower }}
       TARGET_LANG: ${{ needs.versioning.outputs.lang }}
