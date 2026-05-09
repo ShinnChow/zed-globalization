@@ -101,7 +101,20 @@ jobs:
                 version: $version, description: $desc,
                 homepage: $homepage, license: "GPL-3.0-only",
                 architecture: {"64bit": {url: $url_x64, hash: $hash_x64}},
-                bin: "ZedG.exe", shortcuts: [["ZedG.exe", "ZedG"]],
+                bin: [["bin\\ZedG.exe", "zedg"]],
+                shortcuts: [["ZedG.exe", "ZedG"]],
+                post_install: [
+                  "$desktop = [Environment]::GetFolderPath(\"Desktop\")",
+                  "$ws = New-Object -ComObject WScript.Shell",
+                  "$lnk = $ws.CreateShortcut(\"$desktop\\ZedG.lnk\")",
+                  "$lnk.TargetPath = \"$dir\\ZedG.exe\"",
+                  "$lnk.WorkingDirectory = \"$dir\"",
+                  "$lnk.Save()"
+                ],
+                pre_uninstall: [
+                  "$desktop = [Environment]::GetFolderPath(\"Desktop\")",
+                  "Remove-Item \"$desktop\\ZedG.lnk\" -ErrorAction SilentlyContinue"
+                ],
                 checkver: {github: $homepage},
                 autoupdate: {architecture: {"64bit": {
                   url: $au_url, hash: {url: $au_hash, regex: $au_regex}

@@ -433,6 +433,11 @@ jobs:
           python3 "$env:GITHUB_WORKSPACE\script\ci-build.py" --source-dir D:\z --jobs 4 --retries 3
           $buildExit = $LASTEXITCODE
 
+          if ($buildExit -eq 0) {
+            Write-Host "=== 编译 CLI 辅助二进制 ==="
+            cargo build --release --package cli --locked --manifest-path D:\z\Cargo.toml
+          }
+
           # 停止监控并输出摘要
           Stop-Job $monitorJob; Remove-Job $monitorJob
           Write-Host "===== 内存监控摘要 ====="
@@ -544,7 +549,9 @@ jobs:
         shell: pwsh
         run: |
           mkdir zed-dist
+          mkdir zed-dist\bin
           Copy-Item "D:\z\target\release\zed.exe" zed-dist\ZedG.exe
+          Copy-Item "D:\z\target\release\cli.exe" zed-dist\bin\ZedG.exe
           Compress-Archive -Path zed-dist\* -DestinationPath "zedg-$env:LANG_LOWER-windows-x86_64-$env:BUILD_VERSION.zip"
 
       - name: 上传产物
@@ -747,6 +754,11 @@ jobs:
           python3 "$env:GITHUB_WORKSPACE\script\ci-build.py" --source-dir C:\z --target aarch64-pc-windows-msvc --jobs 4 --retries 3
           $buildExit = $LASTEXITCODE
 
+          if ($buildExit -eq 0) {
+            Write-Host "=== 编译 CLI 辅助二进制 ==="
+            cargo build --release --package cli --locked --target aarch64-pc-windows-msvc --manifest-path C:\z\Cargo.toml
+          }
+
           Stop-Job $monitorJob; Remove-Job $monitorJob
           Write-Host "===== 内存监控摘要 ====="
           if (Test-Path "C:\mem_monitor.csv") {
@@ -857,7 +869,9 @@ jobs:
         shell: pwsh
         run: |
           mkdir zed-dist
+          mkdir zed-dist\bin
           Copy-Item "C:\z\target\aarch64-pc-windows-msvc\release\zed.exe" zed-dist\ZedG.exe
+          Copy-Item "C:\z\target\aarch64-pc-windows-msvc\release\cli.exe" zed-dist\bin\ZedG.exe
           Compress-Archive -Path zed-dist\* -DestinationPath "zedg-$env:LANG_LOWER-windows-aarch64-$env:BUILD_VERSION.zip"
 
       - name: 上传产物
@@ -902,12 +916,14 @@ jobs:
           $guidArm64 = "{7E5B3C9D-2E4F-6A8B-0C1D-3E5F7A9B1C2D}"
 
           function Build-Msi {
-            param($Arch, $ZipPath, $ExeSubPath, $UpgradeCode, $OutFile)
+            param($Arch, $ZipPath, $ExeSubPath, $CliSubPath, $UpgradeCode, $OutFile)
             Expand-Archive $ZipPath -DestinationPath "extracted\$Arch" -Force
             $exePath = Resolve-Path "extracted\$Arch\$ExeSubPath"
+            $cliPath = Resolve-Path "extracted\$Arch\$CliSubPath"
             candle -arch $Arch `
               "-dAppVersion=$msiVer" `
               "-dSourceExe=$exePath" `
+              "-dSourceCli=$cliPath" `
               "-dUpgradeCode=$UpgradeCode" `
               .github\installer\zedg.wxs `
               -o "$Arch.wixobj"
@@ -918,6 +934,7 @@ jobs:
             -Arch x64 `
             -ZipPath "artifacts\x64\zedg-$env:LANG_LOWER-windows-x86_64-$env:BUILD_VERSION.zip" `
             -ExeSubPath ZedG.exe `
+            -CliSubPath bin\ZedG.exe `
             -UpgradeCode $guidX64 `
             -OutFile "zedg-$env:LANG_LOWER-windows-x86_64-$env:BUILD_VERSION.msi"
 
@@ -925,6 +942,7 @@ jobs:
             -Arch arm64 `
             -ZipPath "artifacts\arm64\zedg-$env:LANG_LOWER-windows-aarch64-$env:BUILD_VERSION.zip" `
             -ExeSubPath ZedG.exe `
+            -CliSubPath bin\ZedG.exe `
             -UpgradeCode $guidArm64 `
             -OutFile "zedg-$env:LANG_LOWER-windows-aarch64-$env:BUILD_VERSION.msi"
 
