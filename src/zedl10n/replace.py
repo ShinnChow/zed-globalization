@@ -48,15 +48,25 @@ _ASCII_IDENTIFIER = re.compile(r'^[a-z][a-z0-9_-]*$')
 _ZH_PUNCT_BETWEEN_STRINGS = re.compile(r'(?<=\w")\s*[、，]\s*(?=")')
 _ZH_SEMICOLON_BETWEEN_STRINGS = re.compile(r'(?<=\w")\s*[；]\s*(?=")')
 
-# 不可替换区域：字节字符串 + 属性宏
+# 不可替换区域：字节串 + 原始字符串 + 属性宏 + key context + 序列化标识符
 # 字节字符串: br##"..."##, br#"..."#, br"...", b"..."
+# 原始字符串: r#"..."#, r"..." —— 内容是正则/路径/shell 模式，按普通字符串
+#   转义写回会把 r"fn (.+?)\(" 变成 r"fn (.+?)\\("，正则编译 panic
 # 属性宏: #[action(...)], #[serde(...)], #[derive(...)] 等
+# key context: key_context.add("Editor")、dispatch_context.set("mode", "full")
+#   —— 译成中文后 keymap 里的 "context": "Terminal" 全部匹配不上
+# 序列化标识符: fn serialized_item_kind() -> &'static str { "Terminal" }
 # 注意: #[error("...")] 包含用户可见的错误消息，不应被保护
 _PROTECTED_RE = re.compile(
     r'br(#+)".*?"\1'               # br#"..."#
     r'|br"(?:[^"\\]|\\.)*"'        # br"..."
     r'|b"(?:[^"\\]|\\.)*"'         # b"..."
-    r'|#\[(?!error\b)[\w:]+\([^]]*?\)\]',  # #[attr(...)]（排除 #[error]）
+    r'|(?<![A-Za-z0-9_])r(#+)".*?"\2'      # r#"..."#
+    r'|(?<![A-Za-z0-9_])r"[^"]*"'          # r"..."
+    r'|#\[(?!error\b)[\w:]+\([^]]*?\)\]'   # #[attr(...)]（排除 #[error]）
+    r'|\w*[Cc]ontext\.(?:add|set)\([^)]*\)'          # key_context.add("Editor")
+    r'|KeyContext::(?:parse|new_with_defaults)\([^)]*\)'
+    r'|fn\s+serialized_item_kind\b[^{]*\{[^}]*\}',   # 序列化类型标识符
     re.DOTALL,
 )
 
