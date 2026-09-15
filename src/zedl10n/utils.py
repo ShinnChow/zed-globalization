@@ -13,6 +13,8 @@ from typing import Any
 
 import yaml
 
+log = logging.getLogger(__name__)
+
 # 翻译字典类型：{文件路径: {原文: 译文}}
 TranslationDict = dict[str, dict[str, str]]
 
@@ -126,7 +128,12 @@ def setup_logging(verbose: bool = False) -> None:
 
 
 def parse_json_response(raw: str) -> dict[str, str]:
-    """从 AI 返回的文本中提取 JSON，容忍 markdown 代码块包裹"""
+    """从 AI 返回的文本中提取 JSON，容忍 markdown 代码块包裹。
+
+    模型偶尔会把译文包成对象（{"原文": {"translation": "译文"}}）或数组。
+    这类值不是字符串，放行会在下游占位符校验处炸掉整个 workflow，
+    因此逐条丢弃——全部非法时返回空字典，由调用方的重试/降级链接管。
+    """
     import re
 
     for extract in [
@@ -142,9 +149,21 @@ def parse_json_response(raw: str) -> dict[str, str]:
         if text is None:
             continue
         try:
-            return json.loads(text)
+            data = json.loads(text)
         except (json.JSONDecodeError, TypeError):
             continue
+        if not isinstance(data, dict):
+            continue  # 顶层不是对象（数组/标量），换下一种提取方式
+        clean = {
+            k: v for k, v in data.items()
+            if isinstance(k, str) and isinstance(v, str)
+        }
+        if len(clean) != len(data):
+            log.warning(
+                "AI 返回 %d/%d 条译文结构异常（值非字符串），已丢弃",
+                len(data) - len(clean), len(data),
+            )
+        return clean
     return {}
 
 
