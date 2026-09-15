@@ -53,7 +53,10 @@ env:
   RUSTC_WRAPPER: "sccache"
   CARGO_INCREMENTAL: "0"
   SCCACHE_RECACHE_THIRD_PARTY_DEPS: "1"
-  SCCACHE_CACHE_SIZE: "10G"
+  # 10G 时缓存顶满上限，恢复阶段要下载+解压约 11GB，叠加 release target
+  # 后撑爆 runner 磁盘：Linux 被平台回收（exit 143），macOS 拖满 6 小时
+  # 上限被取消。只有缓存 3.5G 的 Windows 幸存。
+  SCCACHE_CACHE_SIZE: "5G"
   SCCACHE_IDLE_TIMEOUT: "0"
   # === 网络稳定性 ===
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
@@ -190,6 +193,9 @@ jobs:
 
       - name: 安装 Python 与工具
         run: pip install .
+
+      - name: 校验保护规则与响应解析
+        run: python3 test_zedl10n.py
 
       - name: 从 i18n 分支获取翻译文件和禁止翻译列表
         id: get_trans
