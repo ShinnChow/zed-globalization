@@ -275,6 +275,7 @@ async def _translate_async(
     glossary_path: str,
     ai_cfg: AIConfig,
     source_root: str = "",
+    skip_sets: tuple[set[tuple[str, str]], set[str]] | None = None,
 ) -> TranslationDict:
     """异步并发翻译"""
     from openai import AsyncOpenAI
@@ -290,12 +291,19 @@ async def _translate_async(
 
     result: TranslationDict = {fp: dict(v) for fp, v in existing.items()}
     tasks: list[asyncio.Task] = []
+    skip_covered, skip_global = skip_sets or (set(), set())
+    skipped = 0
 
     for file_path, strings in all_strings.items():
         to_translate: dict[str, str] = {}
         if file_path not in result:
             result[file_path] = {}
         for s in strings:
+            # 已判定「确定无需翻译」的条目：空值不再被当成待补翻的缺口，
+            # 否则每轮增量都要把几万条代码标识符重新问一遍 AI。
+            if s in skip_global or (file_path, s) in skip_covered:
+                skipped += 1
+                continue
             if mode == "full" or s not in result.get(file_path, {}):
                 to_translate[s] = ""
             elif mode == "incremental" and not str(result[file_path].get(s, "")).strip():
@@ -324,6 +332,8 @@ async def _translate_async(
             tasks.append(asyncio.create_task(do_batch()))
 
     total = len(tasks)
+    if skipped:
+        log.info("按禁翻清单跳过 %d 条", skipped)
     log.info("共 %d 个翻译批次，并发数 %d", total, ai_cfg.concurrency)
     pbar = ProgressBar(total, desc="翻译")
 
@@ -359,6 +369,7 @@ def translate_all(
     lang: str = "zh-CN",
     ai_cfg: AIConfig | None = None,
     source_root: str = "",
+    do_not_translate: str = "",
 ) -> None:
     """同步入口"""
     if ai_cfg is None:
@@ -368,10 +379,19 @@ def translate_all(
     all_strings: TranslationDict = load_json(strings_path)
     existing = load_json(output_path) if Path(output_path).exists() else {}
 
+    from .untranslatable import load_skip_sets
+
+    skip_sets = load_skip_sets(do_not_translate)
+    if skip_sets[0] or skip_sets[1]:
+        log.info(
+            "已加载禁翻清单: %d 条文件级 + %d 条全局",
+            len(skip_sets[0]), len(skip_sets[1]),
+        )
+
     result = asyncio.run(
         _translate_async(
             all_strings, existing, mode, lang,
-            glossary_path, ai_cfg, source_root,
+            glossary_path, ai_cfg, source_root, skip_sets,
         )
     )
     # 全角 ASCII 符号统一转半角，避免破坏 Rust 源码语法
@@ -408,4 +428,5 @@ def run(args: argparse.Namespace) -> None:
         args.lang,
         ai_cfg,
         source_root=getattr(args, "source_root", ""),
+        do_not_translate=getattr(args, "do_not_translate", ""),
     )

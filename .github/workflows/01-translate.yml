@@ -193,6 +193,10 @@ jobs:
           git checkout origin/i18n -- string_context.json 2>/dev/null || echo '{}' > string_context.json
           # 获取整个 i18n/ 目录（含 tag 子目录和旧版平铺文件）
           git checkout origin/i18n -- i18n/ 2>/dev/null || mkdir -p i18n
+          # 禁翻清单：由 05 标记流程维护，翻译时据此跳过代码标识符
+          mkdir -p config
+          git checkout origin/i18n -- config/do_not_translate.json 2>/dev/null \
+            || echo "禁翻清单尚不存在，本轮全量翻译"
 
       - name: 确定参数
         id: params
@@ -373,7 +377,8 @@ jobs:
             --glossary config/glossary.yaml \
             --source-root zed \
             --mode "$EXTRACT_MODE" \
-            --lang "$TARGET_LANG"
+            --lang "$TARGET_LANG" \
+            --do-not-translate config/do_not_translate.json
 
       - name: 修复占位符错误并清理无效条目
         env:

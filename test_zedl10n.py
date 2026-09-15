@@ -14,6 +14,9 @@ from zedl10n.prompts import validate_placeholders  # noqa: E402
 from zedl10n.replace import (  # noqa: E402
     _escape_for_rust_source, _find_protected_ranges, _replace_skip_protected,
 )
+from zedl10n.untranslatable import (  # noqa: E402
+    collect_candidates, load_skip_sets, rule_verdict,
+)
 from zedl10n.utils import parse_json_response  # noqa: E402
 
 
@@ -137,6 +140,59 @@ def test_bad_response_no_longer_crashes_validation() -> None:
     result = parse_json_response(raw)
     validate_placeholders(result)  # 修复前这里 AttributeError
     assert result == {"c {}": "丙 {}"}
+
+
+def test_rules_never_claim_ui_text() -> None:
+    """禁翻规则必须保守：误判会让界面文案永久得不到翻译
+
+    这几条都曾被早期规则误判——"New:" 被当成 URI scheme，
+    "Follow-up"/"Read/Write" 被当成带分隔符的标识符，"AI"/"OK"
+    被当成裸标识符。
+    """
+    ui_text = [
+        "New:", "From:", "Debugger:", "Searching:", "Input:", "WSL:",
+        "Follow-up", "Read/Write", "AI", "OK", "Save", "Cancel",
+        "Failed to open file", "Rename symbol",
+    ]
+    for s in ui_text:
+        assert rule_verdict(s) is None, f"界面文案被误判: {s!r}"
+
+
+def test_rules_catch_obvious_identifiers() -> None:
+    """明确不该翻译的形态必须被规则拦下，否则白白送 AI"""
+    expected = {
+        "tool_name": "rule:identifier",
+        "output_before_kill": "rule:identifier",
+        "/tmp/foo": "rule:path",
+        "main.rs": "rule:path",
+        "theme.mode": "rule:path",
+        "https://zed.dev/docs": "rule:uri",
+        "mailto:user@example.com": "rule:uri",
+        "  ": "rule:punctuation",
+        "42": "rule:numeric",
+        "100%": "rule:numeric",
+        "": "rule:empty_string",
+    }
+    for s, want in expected.items():
+        assert rule_verdict(s) == want, f"{s!r} -> {rule_verdict(s)}, 期望 {want}"
+
+
+def test_skip_sets_missing_file() -> None:
+    """清单缺失不是错误，返回空集让流程照常全量翻译"""
+    assert load_skip_sets("") == (set(), set())
+    assert load_skip_sets("/nonexistent/do_not_translate.json") == (set(), set())
+
+
+def test_collect_candidates_only_empty_and_uncovered() -> None:
+    """只收集译文为空、且尚未进清单的条目"""
+    translations = {
+        "a.rs": {"Save": "保存", "tool_name": "", "already": ""},
+        "b.rs": {"globally_skipped": ""},
+    }
+    covered = {("a.rs", "already")}
+    covered_global = {"globally_skipped"}
+    got = collect_candidates(translations, covered, covered_global)
+    assert got == [("a.rs", "tool_name")], got
 
 
 def main() -> int:

@@ -1,0 +1,117 @@
+name: 05 标记无需翻译条目
+
+# 独立于增量翻译运行：把译文为空且确属代码标识符的条目固化进禁翻清单，
+# 使 01 提取与翻译不再每轮重问一遍。空字符串在翻译结果里同时表示「AI 失败
+# 该重试」和「本就无需翻译」，两者分不开时只能全部重翻——本流程负责把后
+# 者拆出来。
+
+on:
+  schedule:
+    - cron: "37 19 * * 0" # 每周日（UTC）跑一次，清理新积累的空值
+  workflow_dispatch:
+    inputs:
+      target_lang:
+        description: "目标语言"
+        type: choice
+        options:
+          - zh-CN
+          - zh-TW
+          - ja
+          - ko
+        default: zh-CN
+      rules_only:
+        description: "只用规则判定，不调用 AI"
+        type: boolean
+        default: false
+      limit:
+        description: "单次最多送 AI 判定的条目数（0 = 不限）"
+        type: string
+        required: false
+        default: "0"
+
+concurrency:
+  group: mark-untranslatable
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  mark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: pip install ".[ai]"
+
+      - name: 从 i18n 分支获取翻译结果与禁翻清单
+        run: |
+          git fetch origin i18n
+          git checkout origin/i18n -- i18n/ 2>/dev/null || mkdir -p i18n
+          mkdir -p config
+          git checkout origin/i18n -- config/do_not_translate.json 2>/dev/null \
+            || echo "禁翻清单尚不存在，将新建"
+
+      - name: 选择最新版本的翻译文件
+        id: pick
+        env:
+          INPUT_LANG: ${{ inputs.target_lang }}
+        run: |
+          LANG_NAME="${INPUT_LANG:-zh-CN}"
+          if ! ls -d i18n/v*/ >/dev/null 2>&1; then
+            echo "::error::i18n/ 下没有任何版本目录"
+            exit 1
+          fi
+          # 逐个版本从新到旧找，取第一个存在该语言翻译的
+          TRANS=""
+          for V in $(ls -d i18n/v*/ | sed 's|i18n/||;s|/||' | sort -Vr); do
+            if [ -f "i18n/${V}/${LANG_NAME}.json" ]; then
+              TRANS="i18n/${V}/${LANG_NAME}.json"
+              break
+            fi
+          done
+          if [ -z "$TRANS" ]; then
+            echo "::error::未找到 ${LANG_NAME} 的翻译文件"
+            exit 1
+          fi
+          echo "使用翻译文件: $TRANS"
+          echo "trans_file=$TRANS" >> $GITHUB_OUTPUT
+
+      - name: 判定并更新禁翻清单
+        env:
+          AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_MODEL: ${{ secrets.AI_MODEL }}
+          AI_CONCURRENCY: ${{ vars.AI_CONCURRENCY || '10' }}
+          RULES_ONLY: ${{ inputs.rules_only }}
+          LIMIT: ${{ inputs.limit }}
+        run: |
+          ARGS=(--input "${{ steps.pick.outputs.trans_file }}"
+                --do-not-translate config/do_not_translate.json
+                --limit "${LIMIT:-0}")
+          [ "$RULES_ONLY" = "true" ] && ARGS+=(--rules-only)
+          zedl10n mark-untranslatable "${ARGS[@]}"
+
+      - name: 推送禁翻清单到 i18n 分支
+        run: |
+          cp config/do_not_translate.json /tmp/do_not_translate.json
+
+          git clone --branch i18n --single-branch --depth 1 \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
+            /tmp/i18n-branch
+
+          mkdir -p /tmp/i18n-branch/config
+          cp /tmp/do_not_translate.json /tmp/i18n-branch/config/
+
+          cd /tmp/i18n-branch
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add config/do_not_translate.json
+          git diff --cached --quiet \
+            || git commit -m "chore(i18n): 更新禁翻清单，减少增量翻译重复请求"
+          git push origin i18n
