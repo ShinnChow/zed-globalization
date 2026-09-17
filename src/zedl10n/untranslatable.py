@@ -282,9 +282,12 @@ def collect_candidates(
 
 
 async def _judge_all(
-    items: list[tuple[str, str]], ai_cfg: AIConfig,
-) -> dict[tuple[str, str], str]:
-    """并发调用 AI 判定，返回 {(文件, 原文): 分类}。"""
+    items: list[tuple[str, str]],
+    ai_cfg: AIConfig,
+    data: dict,
+    dnt_path: str,
+) -> int:
+    """并发调用 AI 判定，每完成一批立即追加到 data["entries"] 并保存进度，返回判定总数。"""
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI(base_url=ai_cfg.base_url, api_key=ai_cfg.api_key)
@@ -301,7 +304,7 @@ async def _judge_all(
             return fp, await _judge_batch(client, ai_cfg.model, fp, strings)
 
     tasks = [asyncio.create_task(one(fp, ss)) for fp, ss in batches]
-    verdicts: dict[tuple[str, str], str] = {}
+    judged_count = 0
     pbar = ProgressBar(len(tasks), desc="判定")
     for coro in asyncio.as_completed(tasks):
         if _shutdown_requested:
@@ -311,11 +314,16 @@ async def _judge_all(
                     task.cancel()
             break
         fp, judged = await coro
+        # 立即追加到 data 并保存，确保每批完成后进度都被持久化
         for s, reason in judged.items():
-            verdicts[(fp, s)] = f"ai:{reason}"
-        pbar.update(extra=f"已判定 {len(verdicts)}")
+            entry = {"file": fp, "original": s, "reason": f"ai:{reason}"}
+            data["entries"].append(entry)
+            judged_count += 1
+        if judged:
+            save_json(data, dnt_path)
+        pbar.update(extra=f"已判定 {judged_count}")
     pbar.finish()
-    return verdicts
+    return judged_count
 
 
 def mark_untranslatable(
@@ -344,7 +352,8 @@ def mark_untranslatable(
     if not candidates:
         return {"candidates": 0, "by_rule": 0, "by_ai": 0, "added": 0}
 
-    new_entries: list[dict[str, str]] = []
+    # 实时追加到 data["entries"]，确保信号处理器能保存增量进度
+    added_count = 0
     undecided: list[tuple[str, str]] = []
     for file_path, original in candidates:
         if _shutdown_requested:
@@ -352,12 +361,12 @@ def mark_untranslatable(
             break
         reason = rule_verdict(original)
         if reason:
-            new_entries.append(
-                {"file": file_path, "original": original, "reason": reason},
-            )
+            entry = {"file": file_path, "original": original, "reason": reason}
+            data["entries"].append(entry)
+            added_count += 1
         else:
             undecided.append((file_path, original))
-    by_rule = len(new_entries)
+    by_rule = added_count
     log.info("规则判定 %d 条，剩余 %d 条待 AI 判定", by_rule, len(undecided))
 
     by_ai = 0
@@ -367,15 +376,11 @@ def mark_untranslatable(
             undecided = undecided[:limit]
         if ai_cfg is None:
             ai_cfg = AIConfig()
-        verdicts = asyncio.run(_judge_all(undecided, ai_cfg))
-        for (file_path, original), reason in verdicts.items():
-            new_entries.append(
-                {"file": file_path, "original": original, "reason": reason},
-            )
-        by_ai = len(verdicts)
+        # _judge_all 现在直接追加到 data 并返回判定总数
+        by_ai = asyncio.run(_judge_all(undecided, ai_cfg, data, dnt_path))
+        added_count += by_ai
 
-    # 更新数据并保存
-    data["entries"].extend(new_entries)
+    # 最终排序并保存
     data["entries"].sort(key=lambda e: (e["file"], e["original"]))
     save_json(data, dnt_path)
 
@@ -384,17 +389,17 @@ def mark_untranslatable(
     _current_dnt_path = None
 
     if _shutdown_requested:
-        log.warning("由于收到关闭信号，提前保存了 %d 条新增条目", len(new_entries))
+        log.warning("由于收到关闭信号，提前保存了 %d 条新增条目", added_count)
     else:
         log.info(
             "清单已更新: 新增 %d 条（规则 %d + AI %d），总计 %d 条",
-            len(new_entries), by_rule, by_ai, len(data["entries"]),
+            added_count, by_rule, by_ai, len(data["entries"]),
         )
     return {
         "candidates": len(candidates),
         "by_rule": by_rule,
         "by_ai": by_ai,
-        "added": len(new_entries),
+        "added": added_count,
     }
 
 
