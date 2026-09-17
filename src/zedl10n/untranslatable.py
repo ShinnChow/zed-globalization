@@ -20,6 +20,8 @@ import asyncio
 import json
 import logging
 import re
+import signal
+import sys
 from pathlib import Path
 
 from .utils import (
@@ -27,6 +29,28 @@ from .utils import (
 )
 
 log = logging.getLogger(__name__)
+
+# 全局状态：用于信号处理
+_shutdown_requested = False
+_current_data = None
+_current_dnt_path = None
+
+
+def _signal_handler(signum, frame):
+    """处理 SIGTERM/SIGINT 信号，保存当前进度后退出。"""
+    global _shutdown_requested, _current_data, _current_dnt_path
+    log.warning("收到信号 %d，准备优雅退出", signum)
+    _shutdown_requested = True
+
+    # 立即保存当前进度
+    if _current_data is not None and _current_dnt_path is not None:
+        try:
+            save_json(_current_data, _current_dnt_path)
+            log.info("已保存当前进度到 %s", _current_dnt_path)
+        except Exception as e:
+            log.error("保存进度失败: %s", e)
+
+    sys.exit(0)
 
 # ---------------------------------------------------------------------------
 # 保守规则：命中即判定为无需翻译，reason 统一加 rule: 前缀以便追溯来源
@@ -269,6 +293,10 @@ async def _judge_all(
     log.info("AI 判定: %d 条，拆分为 %d 批", len(items), len(batches))
 
     async def one(fp: str, strings: list[str]) -> tuple[str, dict[str, str]]:
+        # 检查是否收到关闭信号
+        if _shutdown_requested:
+            log.info("收到关闭信号，停止处理新批次")
+            return fp, {}
         async with semaphore:
             return fp, await _judge_batch(client, ai_cfg.model, fp, strings)
 
@@ -276,6 +304,12 @@ async def _judge_all(
     verdicts: dict[tuple[str, str], str] = {}
     pbar = ProgressBar(len(tasks), desc="判定")
     for coro in asyncio.as_completed(tasks):
+        if _shutdown_requested:
+            log.info("收到关闭信号，取消剩余任务")
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            break
         fp, judged = await coro
         for s, reason in judged.items():
             verdicts[(fp, s)] = f"ai:{reason}"
@@ -292,8 +326,19 @@ def mark_untranslatable(
     limit: int = 0,
 ) -> dict[str, int]:
     """扫描翻译文件中的空值并扩充禁翻清单，返回统计。"""
+    global _current_data, _current_dnt_path
+
+    # 注册信号处理器
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
     translations: TranslationDict = load_json(trans_path)
     data, covered, covered_global = _load_registry(dnt_path)
+
+    # 设置全局变量，以便信号处理器可以保存进度
+    _current_data = data
+    _current_dnt_path = dnt_path
+
     candidates = collect_candidates(translations, covered, covered_global)
     log.info("待判定空值条目: %d", len(candidates))
     if not candidates:
@@ -302,6 +347,9 @@ def mark_untranslatable(
     new_entries: list[dict[str, str]] = []
     undecided: list[tuple[str, str]] = []
     for file_path, original in candidates:
+        if _shutdown_requested:
+            log.warning("收到关闭信号，停止规则判定")
+            break
         reason = rule_verdict(original)
         if reason:
             new_entries.append(
@@ -313,7 +361,7 @@ def mark_untranslatable(
     log.info("规则判定 %d 条，剩余 %d 条待 AI 判定", by_rule, len(undecided))
 
     by_ai = 0
-    if use_ai and undecided:
+    if use_ai and undecided and not _shutdown_requested:
         if limit > 0 and len(undecided) > limit:
             log.info("本次只处理前 %d 条（--limit）", limit)
             undecided = undecided[:limit]
@@ -326,13 +374,22 @@ def mark_untranslatable(
             )
         by_ai = len(verdicts)
 
+    # 更新数据并保存
     data["entries"].extend(new_entries)
     data["entries"].sort(key=lambda e: (e["file"], e["original"]))
     save_json(data, dnt_path)
-    log.info(
-        "清单已更新: 新增 %d 条（规则 %d + AI %d），总计 %d 条",
-        len(new_entries), by_rule, by_ai, len(data["entries"]),
-    )
+
+    # 清除全局变量
+    _current_data = None
+    _current_dnt_path = None
+
+    if _shutdown_requested:
+        log.warning("由于收到关闭信号，提前保存了 %d 条新增条目", len(new_entries))
+    else:
+        log.info(
+            "清单已更新: 新增 %d 条（规则 %d + AI %d），总计 %d 条",
+            len(new_entries), by_rule, by_ai, len(data["entries"]),
+        )
     return {
         "candidates": len(candidates),
         "by_rule": by_rule,

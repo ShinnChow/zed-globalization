@@ -87,7 +87,7 @@ jobs:
           AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
           AI_MODEL: ${{ secrets.AI_MODEL }}
-          AI_CONCURRENCY: ${{ vars.AI_CONCURRENCY || '10' }}
+          AI_CONCURRENCY: ${{ vars.AI_CONCURRENCY || '100' }}
           RULES_ONLY: ${{ inputs.rules_only }}
           LIMIT: ${{ inputs.limit }}
         run: |
@@ -100,16 +100,30 @@ jobs:
           TIMEOUT=18000
           START_TIME=$(date +%s)
 
-          # 后台运行，带超时监控
+          # 后台运行 mark-untranslatable
+          zedl10n mark-untranslatable "${ARGS[@]}" &
+          ZEDL10N_PID=$!
+
+          # 监控运行时间
           (
-            while true; do
+            while kill -0 $ZEDL10N_PID 2>/dev/null; do
               CURRENT_TIME=$(date +%s)
               ELAPSED=$((CURRENT_TIME - START_TIME))
 
               if [ $ELAPSED -ge $TIMEOUT ]; then
                 echo "⏰ 运行时间达到 5 小时，触发自动提交"
-                pkill -P $$ zedl10n || true
-                exit 124  # timeout exit code
+                # 发送 SIGTERM 让程序优雅退出并保存进度
+                kill -TERM $ZEDL10N_PID 2>/dev/null || true
+                # 等待最多 60 秒让程序保存数据
+                for i in {1..60}; do
+                  if ! kill -0 $ZEDL10N_PID 2>/dev/null; then
+                    break
+                  fi
+                  sleep 1
+                done
+                # 如果还没退出，强制终止
+                kill -KILL $ZEDL10N_PID 2>/dev/null || true
+                exit 124
               fi
 
               sleep 60
@@ -117,18 +131,20 @@ jobs:
           ) &
           MONITOR_PID=$!
 
-          # 运行 mark-untranslatable（增量模式）
+          # 等待 zedl10n 完成或超时
           set +e
-          zedl10n mark-untranslatable "${ARGS[@]}"
+          wait $ZEDL10N_PID
           EXIT_CODE=$?
           set -e
 
           # 停止监控
           kill $MONITOR_PID 2>/dev/null || true
+          wait $MONITOR_PID 2>/dev/null || true
 
           # 如果超时，继续执行提交步骤
-          if [ $EXIT_CODE -eq 124 ]; then
+          if [ $EXIT_CODE -eq 124 ] || [ $EXIT_CODE -eq 143 ]; then
             echo "📝 超时保护触发，提交当前已完成的禁翻清单"
+            exit 0
           elif [ $EXIT_CODE -ne 0 ]; then
             echo "❌ 执行失败，退出码：$EXIT_CODE"
             exit $EXIT_CODE
