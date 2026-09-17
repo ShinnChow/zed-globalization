@@ -338,13 +338,56 @@ jobs:
           if [ -f "$TRANS_FILE" ]; then
             echo "已存在当前版本翻译: $TRANS_FILE"
           else
-            # 从最近的版本目录获取基础翻译
+            # 从最近的版本目录获取基础翻译（基于数字比较版本号）
             NEAREST=""
             if ls -d i18n/v*/  >/dev/null 2>&1; then
-              NEAREST=$(ls -d i18n/v*/ | sed 's|i18n/||;s|/||' | sort -V | \
-                awk -v cur="$VERSION" '{
-                  if ($0 < cur) prev=$0
-                } END { if (prev) print prev }')
+              # 拆分版本号为三段数字，找最接近但更旧的版本
+              NEAREST=$(ls -d i18n/v*/ | sed 's|i18n/||;s|/||' | \
+                awk -v cur="$VERSION" '
+                BEGIN {
+                  # 拆分当前版本号: v1.21.0 -> [1, 21, 0]
+                  gsub(/^v/, "", cur)
+                  split(cur, cur_parts, /[.-]/)
+                  cur_maj = cur_parts[1] + 0
+                  cur_min = cur_parts[2] + 0
+                  cur_pat = cur_parts[3] + 0
+                  best = ""
+                  best_maj = -1
+                  best_min = -1
+                  best_pat = -1
+                }
+                {
+                  ver = $0
+                  gsub(/^v/, "", ver)
+                  split(ver, parts, /[.-]/)
+                  maj = parts[1] + 0
+                  min = parts[2] + 0
+                  pat = parts[3] + 0
+
+                  # 数字比较：maj.min.pat < cur_maj.cur_min.cur_pat
+                  is_less = 0
+                  if (maj < cur_maj) is_less = 1
+                  else if (maj == cur_maj && min < cur_min) is_less = 1
+                  else if (maj == cur_maj && min == cur_min && pat < cur_pat) is_less = 1
+
+                  if (!is_less) next
+
+                  # 找最大的那个小于当前版本的
+                  is_better = 0
+                  if (best == "") is_better = 1
+                  else if (maj > best_maj) is_better = 1
+                  else if (maj == best_maj && min > best_min) is_better = 1
+                  else if (maj == best_maj && min == best_min && pat > best_pat) is_better = 1
+
+                  if (is_better) {
+                    best = $0
+                    best_maj = maj
+                    best_min = min
+                    best_pat = pat
+                  }
+                }
+                END { if (best) print best }
+              ')
             fi
 
             if [ -n "$NEAREST" ] && [ -f "i18n/${NEAREST}/${TARGET_LANG}.json" ]; then
