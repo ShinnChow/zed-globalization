@@ -136,7 +136,7 @@ _AI_SYSTEM_PROMPT = """你在审查 Zed 代码编辑器源码中提取出的字�
 只输出 JSON 对象，key 为原文，value 为分类标识或空字符串，不要任何解释。"""
 
 # 单批送审的字符预算，判定任务比翻译轻，可以放得比翻译批次大
-_BATCH_CHARS = 6000
+_BATCH_CHARS = 100000
 
 
 def _build_batches(

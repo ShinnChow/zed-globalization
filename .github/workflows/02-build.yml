@@ -1124,10 +1124,10 @@ jobs:
             libxcb-shape0-dev libxcb-xfixes0-dev libxcb-xinerama0-dev \
             libxcb-randr0-dev libxcb-keysyms1-dev libxcb-util-dev \
             libgl1-mesa-dev libegl1-mesa-dev libfreetype6-dev libfontconfig1-dev \
-            libssl-dev libudev-dev libclang-dev clang cmake mold llvm rpm \
+            libssl-dev libudev-dev libclang-dev clang cmake lld llvm rpm \
             patchelf libgit2-dev
           sudo ldconfig
-          echo "RUSTFLAGS=-C link-args=-Wl,--disable-new-dtags,-rpath,\$ORIGIN/../lib/zedg" >> $GITHUB_ENV
+          echo "RUSTFLAGS=-C link-arg=-fuse-ld=lld -C link-args=-Wl,--disable-new-dtags,-rpath,\$ORIGIN/../lib/zedg" >> $GITHUB_ENV
           # issue #30: 22.04 的 gcc-11 对 webrtc-sys 的 C++ 头文件报
           # "changes meaning of 'Network'"（clang 只警告，gcc 当错误）。
           # 显式指定 clang++ 作为 C++ 编译器，与 24.04 默认行为对齐。
@@ -1585,6 +1585,10 @@ jobs:
       - name: 构建 aarch64
         env:
           RELEASE_CHANNEL: stable
+          # macOS 编译优化：减少调试信息和链接时间，加快 CI 构建速度
+          CARGO_PROFILE_RELEASE_DEBUG: "none"          # 禁用调试信息，解决 __eh_frame 超限问题
+          CARGO_PROFILE_RELEASE_LTO: "off"             # 禁用 LTO，大幅减少链接时间
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"    # 增加代码生成单元，加快编译速度
         run: |
           if [ "$SCCACHE_AVAILABLE" = "true" ]; then
             export RUSTC_WRAPPER=sccache
@@ -1823,6 +1827,10 @@ jobs:
       - name: 构建 x86_64
         env:
           RELEASE_CHANNEL: stable
+          # macOS 编译优化：减少调试信息和链接时间，加快 CI 构建速度
+          CARGO_PROFILE_RELEASE_DEBUG: "none"          # 禁用调试信息，解决 __eh_frame 超限问题
+          CARGO_PROFILE_RELEASE_LTO: "off"             # 禁用 LTO，大幅减少链接时间
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"    # 增加代码生成单元，加快编译速度
         run: |
           if [ "$SCCACHE_AVAILABLE" = "true" ]; then
             export RUSTC_WRAPPER=sccache
