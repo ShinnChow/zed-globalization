@@ -1207,6 +1207,27 @@ jobs:
           key: sccache-linux-x86_64
           restore-keys: sccache-linux
 
+      - name: 增加交换空间到 16GB
+        run: |
+          echo "=== 当前内存和交换空间状态 ==="
+          free -h
+
+          echo ""
+          echo "=== 创建 16GB 交换文件 ==="
+          sudo swapoff -a
+          sudo rm -f /swapfile /mnt/swapfile
+
+          # 创建 16GB 交换文件
+          sudo fallocate -l 16G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=16384
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+
+          echo ""
+          echo "=== 新的内存和交换空间状态 ==="
+          free -h
+          echo "✓ 交换空间已扩展到 16GB"
+
       - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -2228,6 +2249,27 @@ jobs:
             ~/.cargo/git
           key: sccache-linux-aarch64
           restore-keys: sccache-linux-arm64
+
+      - name: 增加交换空间到 16GB
+        run: |
+          echo "=== 当前内存和交换空间状态 ==="
+          free -h
+
+          echo ""
+          echo "=== 创建 16GB 交换文件 ==="
+          sudo swapoff -a
+          sudo rm -f /swapfile /mnt/swapfile
+
+          # 创建 16GB 交换文件
+          sudo fallocate -l 16G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=16384
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+
+          echo ""
+          echo "=== 新的内存和交换空间状态 ==="
+          free -h
+          echo "✓ 交换空间已扩展到 16GB"
 
       - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
