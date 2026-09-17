@@ -1093,11 +1093,12 @@ jobs:
       - name: 释放磁盘空间
         uses: jlumbroso/free-disk-space@main
         with:
-          tool-cache: false
+          tool-cache: true          # 改为 true，清理工具缓存获得更多空间
           android: true
           dotnet: true
           haskell: true
           large-packages: true
+          docker-images: true       # 新增：清理 Docker 镜像
           swap-storage: false
 
       - name: 安装 sccache
@@ -1230,19 +1231,63 @@ jobs:
             echo "⚠ sccache 不可用，直接编译（无缓存加速）"
           fi
 
-          # 启动内存监控后台进程
-          MEM_LOG="/tmp/mem_monitor.csv"
-          echo "timestamp,used_mb,total_mb,swap_used_mb,swap_total_mb" > "$MEM_LOG"
+          # 启动实时资源监控（内存 + 磁盘）- 每分钟输出状态，资源紧张时告警
           (
+            # 告警阈值
+            MEM_WARN_PERCENT=85        # 内存使用率告警阈值 85%
+            DISK_WARN_GB=8             # 磁盘剩余空间告警阈值 8GB
+            DISK_CRITICAL_GB=5         # 磁盘剩余空间危急阈值 5GB
+
+            # 告警状态标记（避免重复告警）
+            MEM_WARNED=0
+            DISK_WARNED=0
+            DISK_CRITICAL_WARNED=0
+
+            # 定时输出计数器
+            COUNTER=0
+
             while true; do
-              read _ TOTAL _ FREE _ <<< $(grep -E '^MemTotal:|^MemAvailable:' /proc/meminfo | awk '{print $2}')
+              TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
+              # === 内存监控 ===
               TOTAL_MB=$(($(awk '/^MemTotal:/{print $2}' /proc/meminfo) / 1024))
               AVAIL_MB=$(($(awk '/^MemAvailable:/{print $2}' /proc/meminfo) / 1024))
               USED_MB=$((TOTAL_MB - AVAIL_MB))
+              MEM_PERCENT=$((USED_MB * 100 / TOTAL_MB))
+
               SWAP_TOTAL_MB=$(($(awk '/^SwapTotal:/{print $2}' /proc/meminfo) / 1024))
               SWAP_FREE_MB=$(($(awk '/^SwapFree:/{print $2}' /proc/meminfo) / 1024))
               SWAP_USED_MB=$((SWAP_TOTAL_MB - SWAP_FREE_MB))
-              echo "$(date +%H:%M:%S),$USED_MB,$TOTAL_MB,$SWAP_USED_MB,$SWAP_TOTAL_MB" >> "$MEM_LOG"
+
+              # === 磁盘监控 ===
+              DISK_INFO=$(df -BG / | tail -1 | awk '{gsub(/G/,"",$2); gsub(/G/,"",$3); gsub(/G/,"",$4); print $2,$3,$4}')
+              read DISK_TOTAL_GB DISK_USED_GB DISK_AVAIL_GB <<< "$DISK_INFO"
+
+              # === 定时日志输出（每分钟，即每6次循环） ===
+              COUNTER=$((COUNTER + 1))
+              if [ $((COUNTER % 6)) -eq 0 ]; then
+                echo "📊 [$TIMESTAMP] 资源状态: 内存 ${USED_MB}/${TOTAL_MB}MB (${MEM_PERCENT}%), 磁盘剩余 ${DISK_AVAIL_GB}/${DISK_TOTAL_GB}GB"
+              fi
+
+              # === 内存告警 ===
+              if [ "$MEM_PERCENT" -ge "$MEM_WARN_PERCENT" ] && [ "$MEM_WARNED" -eq 0 ]; then
+                echo "⚠️  [$TIMESTAMP] 内存告警: 使用率 ${MEM_PERCENT}% (${USED_MB}MB/${TOTAL_MB}MB)"
+                MEM_WARNED=1
+              fi
+
+              if [ "$SWAP_USED_MB" -gt 0 ]; then
+                echo "⚠️  [$TIMESTAMP] 交换内存告警: 使用 ${SWAP_USED_MB}MB"
+              fi
+
+              # === 磁盘告警（分级） ===
+              if [ "$DISK_AVAIL_GB" -le "$DISK_CRITICAL_GB" ] && [ "$DISK_CRITICAL_WARNED" -eq 0 ]; then
+                echo "🚨 [$TIMESTAMP] 磁盘空间危急: 仅剩 ${DISK_AVAIL_GB}GB (已用 ${DISK_USED_GB}GB/${DISK_TOTAL_GB}GB)"
+                DISK_CRITICAL_WARNED=1
+              elif [ "$DISK_AVAIL_GB" -le "$DISK_WARN_GB" ] && [ "$DISK_WARNED" -eq 0 ]; then
+                echo "⚠️  [$TIMESTAMP] 磁盘空间告警: 剩余 ${DISK_AVAIL_GB}GB (已用 ${DISK_USED_GB}GB/${DISK_TOTAL_GB}GB)"
+                DISK_WARNED=1
+              fi
+
               sleep 10
             done
           ) &
@@ -1253,18 +1298,10 @@ jobs:
           BUILD_EXIT=$?
           set -e
 
-          # 停止监控并输出摘要
+          # 停止监控
           kill $MONITOR_PID 2>/dev/null || true
-          echo "===== 内存监控摘要 ====="
-          PEAK_MEM=$(tail -n +2 "$MEM_LOG" | cut -d, -f2 | sort -n | tail -1)
-          PEAK_SWAP=$(tail -n +2 "$MEM_LOG" | cut -d, -f4 | sort -n | tail -1)
-          TOTAL_MEM=$(tail -n +2 "$MEM_LOG" | head -1 | cut -d, -f3)
-          TOTAL_SWAP=$(tail -n +2 "$MEM_LOG" | head -1 | cut -d, -f5)
-          SAMPLES=$(tail -n +2 "$MEM_LOG" | wc -l)
-          echo "物理内存: 峰值 ${PEAK_MEM}MB / 总计 ${TOTAL_MEM}MB"
-          echo "交换内存: 峰值 ${PEAK_SWAP}MB / 总计 ${TOTAL_SWAP}MB"
-          if [ "$PEAK_SWAP" -gt 0 ] 2>/dev/null; then echo "⚠ 编译期间使用了交换内存!"; fi
-          echo "采样记录数: $SAMPLES"
+          wait $MONITOR_PID 2>/dev/null || true
+
           [ $BUILD_EXIT -ne 0 ] && exit $BUILD_EXIT
 
           echo "=== 编译 CLI 辅助二进制 ==="
@@ -2215,17 +2252,54 @@ jobs:
             echo "⚠ sccache 不可用，直接编译（无缓存加速）"
           fi
 
-          MEM_LOG="/tmp/mem_monitor.csv"
-          echo "timestamp,used_mb,total_mb,swap_used_mb,swap_total_mb" > "$MEM_LOG"
+          # 启动实时资源监控（内存 + 磁盘）- 仅在资源紧张时输出告警
           (
+            # 告警阈值
+            MEM_WARN_PERCENT=85        # 内存使用率告警阈值 85%
+            DISK_WARN_GB=8             # 磁盘剩余空间告警阈值 8GB
+            DISK_CRITICAL_GB=5         # 磁盘剩余空间危急阈值 5GB
+
+            # 告警状态标记（避免重复告警）
+            MEM_WARNED=0
+            DISK_WARNED=0
+            DISK_CRITICAL_WARNED=0
+
             while true; do
+              TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
+              # === 内存监控 ===
               TOTAL_MB=$(($(awk '/^MemTotal:/{print $2}' /proc/meminfo) / 1024))
               AVAIL_MB=$(($(awk '/^MemAvailable:/{print $2}' /proc/meminfo) / 1024))
               USED_MB=$((TOTAL_MB - AVAIL_MB))
+              MEM_PERCENT=$((USED_MB * 100 / TOTAL_MB))
+
               SWAP_TOTAL_MB=$(($(awk '/^SwapTotal:/{print $2}' /proc/meminfo) / 1024))
               SWAP_FREE_MB=$(($(awk '/^SwapFree:/{print $2}' /proc/meminfo) / 1024))
               SWAP_USED_MB=$((SWAP_TOTAL_MB - SWAP_FREE_MB))
-              echo "$(date +%H:%M:%S),$USED_MB,$TOTAL_MB,$SWAP_USED_MB,$SWAP_TOTAL_MB" >> "$MEM_LOG"
+
+              # === 磁盘监控 ===
+              DISK_INFO=$(df -BG / | tail -1 | awk '{gsub(/G/,"",$2); gsub(/G/,"",$3); gsub(/G/,"",$4); print $2,$3,$4}')
+              read DISK_TOTAL_GB DISK_USED_GB DISK_AVAIL_GB <<< "$DISK_INFO"
+
+              # === 内存告警 ===
+              if [ "$MEM_PERCENT" -ge "$MEM_WARN_PERCENT" ] && [ "$MEM_WARNED" -eq 0 ]; then
+                echo "⚠️  [$TIMESTAMP] 内存告警: 使用率 ${MEM_PERCENT}% (${USED_MB}MB/${TOTAL_MB}MB)"
+                MEM_WARNED=1
+              fi
+
+              if [ "$SWAP_USED_MB" -gt 0 ]; then
+                echo "⚠️  [$TIMESTAMP] 交换内存告警: 使用 ${SWAP_USED_MB}MB"
+              fi
+
+              # === 磁盘告警（分级） ===
+              if [ "$DISK_AVAIL_GB" -le "$DISK_CRITICAL_GB" ] && [ "$DISK_CRITICAL_WARNED" -eq 0 ]; then
+                echo "🚨 [$TIMESTAMP] 磁盘空间危急: 仅剩 ${DISK_AVAIL_GB}GB (已用 ${DISK_USED_GB}GB/${DISK_TOTAL_GB}GB)"
+                DISK_CRITICAL_WARNED=1
+              elif [ "$DISK_AVAIL_GB" -le "$DISK_WARN_GB" ] && [ "$DISK_WARNED" -eq 0 ]; then
+                echo "⚠️  [$TIMESTAMP] 磁盘空间告警: 剩余 ${DISK_AVAIL_GB}GB (已用 ${DISK_USED_GB}GB/${DISK_TOTAL_GB}GB)"
+                DISK_WARNED=1
+              fi
+
               sleep 10
             done
           ) &
@@ -2236,17 +2310,10 @@ jobs:
           BUILD_EXIT=$?
           set -e
 
+          # 停止监控
           kill $MONITOR_PID 2>/dev/null || true
-          echo "===== 内存监控摘要 ====="
-          PEAK_MEM=$(tail -n +2 "$MEM_LOG" | cut -d, -f2 | sort -n | tail -1)
-          PEAK_SWAP=$(tail -n +2 "$MEM_LOG" | cut -d, -f4 | sort -n | tail -1)
-          TOTAL_MEM=$(tail -n +2 "$MEM_LOG" | head -1 | cut -d, -f3)
-          TOTAL_SWAP=$(tail -n +2 "$MEM_LOG" | head -1 | cut -d, -f5)
-          SAMPLES=$(tail -n +2 "$MEM_LOG" | wc -l)
-          echo "物理内存: 峰值 ${PEAK_MEM}MB / 总计 ${TOTAL_MEM}MB"
-          echo "交换内存: 峰值 ${PEAK_SWAP}MB / 总计 ${TOTAL_SWAP}MB"
-          if [ "$PEAK_SWAP" -gt 0 ] 2>/dev/null; then echo "⚠ 编译期间使用了交换内存!"; fi
-          echo "采样记录数: $SAMPLES"
+          wait $MONITOR_PID 2>/dev/null || true
+
           [ $BUILD_EXIT -ne 0 ] && exit $BUILD_EXIT
 
           echo "=== 编译 CLI 辅助二进制 ==="
