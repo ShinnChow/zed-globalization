@@ -82,7 +82,7 @@ jobs:
           echo "使用翻译文件: $TRANS"
           echo "trans_file=$TRANS" >> $GITHUB_OUTPUT
 
-      - name: 判定并更新禁翻清单
+      - name: 判定并更新禁翻清单（增量模式 + 超时保护）
         env:
           AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
@@ -95,7 +95,44 @@ jobs:
                 --do-not-translate config/do_not_translate.json
                 --limit "${LIMIT:-0}")
           [ "$RULES_ONLY" = "true" ] && ARGS+=(--rules-only)
+
+          # 设置超时时间为 5 小时（18000 秒）
+          TIMEOUT=18000
+          START_TIME=$(date +%s)
+
+          # 后台运行，带超时监控
+          (
+            while true; do
+              CURRENT_TIME=$(date +%s)
+              ELAPSED=$((CURRENT_TIME - START_TIME))
+
+              if [ $ELAPSED -ge $TIMEOUT ]; then
+                echo "⏰ 运行时间达到 5 小时，触发自动提交"
+                pkill -P $$ zedl10n || true
+                exit 124  # timeout exit code
+              fi
+
+              sleep 60
+            done
+          ) &
+          MONITOR_PID=$!
+
+          # 运行 mark-untranslatable（增量模式）
+          set +e
           zedl10n mark-untranslatable "${ARGS[@]}"
+          EXIT_CODE=$?
+          set -e
+
+          # 停止监控
+          kill $MONITOR_PID 2>/dev/null || true
+
+          # 如果超时，继续执行提交步骤
+          if [ $EXIT_CODE -eq 124 ]; then
+            echo "📝 超时保护触发，提交当前已完成的禁翻清单"
+          elif [ $EXIT_CODE -ne 0 ]; then
+            echo "❌ 执行失败，退出码：$EXIT_CODE"
+            exit $EXIT_CODE
+          fi
 
       - name: 推送禁翻清单到 i18n 分支
         run: |
